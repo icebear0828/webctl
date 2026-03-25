@@ -1,23 +1,27 @@
 /**
- * Browser-based auth flow — when HTTP session refresh fails,
- * launch browser, let user login, extract session tokens.
+ * Session extraction from user's own Chrome profile.
  *
- * Works for any Google-connected service (Gemini, NotebookLM, etc.)
- * by navigating to the service URL and extracting WIZ_global_data tokens.
+ * Uses Playwright's launchPersistentContext with the user's Chrome profile
+ * directory, so existing Google login is inherited — no manual login needed.
+ *
+ * Flow:
+ *   1. Launch Chromium with user's Chrome profile (already logged in)
+ *   2. Navigate to the service URL
+ *   3. Extract WIZ_global_data tokens + cookies
+ *   4. Save session and close browser
  */
 
+import { platform, homedir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { SessionStore } from './session.js';
-import { resolveBrowserTransport, type BrowserTransportResolved } from './browser.js';
-import { getSetCookies, mergeCookies } from './cookies.js';
 
 export interface GoogleServiceAuthOptions {
-  /** Site name for profile directory */
   site: string;
-  /** Service dashboard URL to navigate to */
   dashboardUrl: string;
-  /** Expected substring in bl token (e.g. 'assistant-bard', 'labs-tailwind') */
   blValidator: string;
-  /** Timeout for waiting for login (ms, default 180000) */
+  /** Chrome profile path override. Default: auto-detect user's Chrome. */
+  chromeProfile?: string;
   loginTimeout?: number;
 }
 
@@ -30,30 +34,77 @@ export interface GoogleServiceSession {
 }
 
 /**
- * Launch browser, navigate to Google service, wait for login,
- * extract WIZ_global_data session tokens + cookies.
+ * Auto-detect the user's default Chrome profile directory.
+ */
+function detectChromeProfile(): string {
+  const home = homedir();
+  const candidates: string[] = [];
+
+  switch (platform()) {
+    case 'darwin':
+      candidates.push(join(home, 'Library', 'Application Support', 'Google', 'Chrome'));
+      break;
+    case 'win32':
+      candidates.push(join(home, 'AppData', 'Local', 'Google', 'Chrome', 'User Data'));
+      break;
+    default: // linux
+      candidates.push(join(home, '.config', 'google-chrome'));
+      candidates.push(join(home, '.config', 'chromium'));
+      break;
+  }
+
+  for (const dir of candidates) {
+    if (existsSync(dir)) return dir;
+  }
+
+  throw new Error(
+    'Chrome profile not found. Specify path with --chrome-profile or install Google Chrome.',
+  );
+}
+
+/**
+ * Extract session from user's Chrome.
  *
- * Priority: CDP (connect to existing Chrome) → Launch new browser.
+ * Opens a temporary Chromium instance with the user's Chrome profile
+ * (inheriting existing Google login), navigates to the service, extracts
+ * tokens and cookies, then closes.
+ *
+ * IMPORTANT: User's Chrome must be closed first — Chrome locks its profile.
  */
 export async function browserLogin<T extends GoogleServiceSession>(
   options: GoogleServiceAuthOptions,
   store: SessionStore<T>,
   extraFields?: Partial<T>,
 ): Promise<T> {
-  let resolved: BrowserTransportResolved | null = null;
+  let pw: typeof import('playwright');
+  try {
+    pw = await import('playwright');
+  } catch {
+    throw new Error('browserLogin requires playwright. Install with: pnpm add playwright');
+  }
+
+  const profileDir = options.chromeProfile ?? detectChromeProfile();
+
+  console.error(`[auth] Using Chrome profile: ${profileDir}`);
+  console.error(`[auth] Make sure Chrome is closed before proceeding.`);
+
+  const context = await pw.chromium.launchPersistentContext(profileDir, {
+    headless: false,
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--remote-allow-origins=*',
+    ],
+    timeout: 30000,
+  });
 
   try {
-    resolved = await resolveBrowserTransport({ site: options.site });
-    const page = await resolved.transport.getPage();
+    const page = context.pages()[0] ?? await context.newPage();
 
-    // Navigate to service
     await page.goto(options.dashboardUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     const currentUrl = page.url();
-    const needsLogin = currentUrl.includes('accounts.google.com');
-
-    if (needsLogin) {
-      console.error(`[auth] Please log in to Google in the browser window...`);
+    if (currentUrl.includes('accounts.google.com')) {
+      console.error('[auth] Not logged in. Please log in to Google in the browser window...');
     }
 
     // Wait for WIZ_global_data tokens
@@ -66,7 +117,7 @@ export async function browserLogin<T extends GoogleServiceSession>(
         return !!wiz['SNlM0e'] && bl.includes(validator);
       },
       blValidator,
-      { timeout: options.loginTimeout ?? 180000 },
+      { timeout: options.loginTimeout ?? 60000 },
     );
 
     // Extract tokens
@@ -80,8 +131,7 @@ export async function browserLogin<T extends GoogleServiceSession>(
       };
     });
 
-    // Extract cookies via context
-    const context = page.context();
+    // Extract cookies
     const cookies = await context.cookies();
     const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
@@ -96,8 +146,6 @@ export async function browserLogin<T extends GoogleServiceSession>(
 
     return session;
   } finally {
-    if (resolved) {
-      await resolved.transport.dispose();
-    }
+    await context.close();
   }
 }
