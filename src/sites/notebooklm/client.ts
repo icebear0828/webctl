@@ -1,14 +1,12 @@
 /**
- * NotebookLM HTTP client — pure Node.js.
- *
- * Supports: notebook CRUD, source management, artifact generation,
- * audio download, chat, quota, and research.
+ * NotebookLM HTTP client — undici + Chrome TLS fingerprint.
  */
 
+import { request, type Agent } from 'undici';
 import type { NotebookSession, NotebookInfo, SourceInfo, ArtifactInfo, StudioConfig, QuotaInfo, ResearchResult } from './types.js';
 import type { SessionStore } from '../../core/session.js';
-import { mergeCookies, getSetCookies } from '../../core/cookies.js';
-import { browserLogin } from '../../core/auth.js';
+import { createChromeTlsAgent } from '../../core/tls.js';
+import { mergeCookies } from '../../core/cookies.js';
 import { NB_RPC, NB_URLS, DEFAULT_USER_CONFIG, PLATFORM_WEB } from './rpc-ids.js';
 import {
   parseCreateNotebook, parseListNotebooks, parseNotebookDetail,
@@ -34,17 +32,23 @@ function parseSecChUa(userAgent: string): { secChUa: string; secChUaMobile: stri
 export class NotebookClient {
   private session: NotebookSession | null = null;
   private store: SessionStore<NotebookSession>;
+  private agent: Agent;
   private reqCounter = 100000;
   private chatThreadId = '';
   private chatHistory: Array<[string, null, number]> = [];
 
   constructor(store: SessionStore<NotebookSession>) {
     this.store = store;
+    this.agent = createChromeTlsAgent();
   }
 
   async loadSession(userId?: string): Promise<boolean> {
     this.session = await this.store.load(userId);
     return this.session !== null;
+  }
+
+  async dispose(): Promise<void> {
+    await this.agent.close();
   }
 
   // ── Low-level RPC ──
@@ -62,26 +66,21 @@ export class NotebookClient {
       ...(session.fsid ? { 'f.sid': session.fsid } : {}),
     });
 
-    const headers = this.buildHeaders();
-    const res = await fetch(`${NB_URLS.BATCH_EXECUTE}?${qp.toString()}`, {
-      method: 'POST', headers, body, redirect: 'follow',
-    });
+    const { statusCode, body: resBody } = await request(
+      `${NB_URLS.BATCH_EXECUTE}?${qp.toString()}`,
+      { method: 'POST', headers: this.buildHeaders(), body, dispatcher: this.agent },
+    );
 
-    const text = await res.text();
+    const text = await resBody.text();
 
-    if (res.status === 401 || res.status === 400) {
-      const refreshed = await this.refreshSession();
-      if (!refreshed) {
-        console.error('[notebooklm] HTTP refresh failed, launching browser login...');
-        this.session = await browserLogin<NotebookSession>(
-          { site: 'notebooklm', dashboardUrl: NB_URLS.DASHBOARD, blValidator: 'labs-tailwind' },
-          this.store,
-        );
-      }
+    if (statusCode === 401 || statusCode === 400) {
+      await this.refreshSession();
       return this.execute(rpcId, payload, sourcePath);
     }
 
-    if (!res.ok) throw new Error(`NotebookLM HTTP ${res.status}: ${text.slice(0, 200)}`);
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`NotebookLM HTTP ${statusCode}: ${text.slice(0, 200)}`);
+    }
     return text;
   }
 
@@ -106,13 +105,15 @@ export class NotebookClient {
       ...(session.fsid ? { 'f.sid': session.fsid } : {}),
     });
 
-    const headers = this.buildHeaders();
-    const res = await fetch(`${NB_URLS.CHAT_STREAM}?${qp.toString()}`, {
-      method: 'POST', headers, body, redirect: 'follow',
-    });
+    const { statusCode, body: resBody } = await request(
+      `${NB_URLS.CHAT_STREAM}?${qp.toString()}`,
+      { method: 'POST', headers: this.buildHeaders(), body, dispatcher: this.agent },
+    );
 
-    const text = await res.text();
-    if (!res.ok) throw new Error(`NotebookLM chat HTTP ${res.status}: ${text.slice(0, 200)}`);
+    const text = await resBody.text();
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`NotebookLM chat HTTP ${statusCode}: ${text.slice(0, 200)}`);
+    }
     return text;
   }
 
@@ -230,27 +231,32 @@ export class NotebookClient {
 
     mkdirSync(outputDir, { recursive: true });
 
-    const res = await fetch(downloadUrl, {
+    const { statusCode, headers: resHeaders, body: resBody } = await request(downloadUrl, {
+      method: 'GET',
       headers: {
         'User-Agent': session.userAgent,
         'Cookie': session.cookies,
         'Accept': '*/*',
         'Referer': `${NB_URLS.BASE}/`,
       },
-      redirect: 'follow',
+      dispatcher: this.agent,
     });
 
-    if (!res.ok) throw new Error(`Audio download failed: HTTP ${res.status}`);
+    if (statusCode !== 200) {
+      const text = await resBody.text();
+      throw new Error(`Audio download failed: HTTP ${statusCode} — ${text.slice(0, 200)}`);
+    }
 
-    const disposition = res.headers.get('content-disposition');
+    const disposition = resHeaders['content-disposition'];
+    const dispStr = Array.isArray(disposition) ? disposition[0] : disposition;
     let filename = `audio_${Date.now()}.m4a`;
-    if (disposition) {
-      const match = disposition.match(/filename="?([^";\n]+)"?/);
+    if (typeof dispStr === 'string') {
+      const match = dispStr.match(/filename="?([^";\n]+)"?/);
       if (match?.[1]) filename = match[1];
     }
 
     const filePath = join(outputDir, filename);
-    const buffer = Buffer.from(await res.arrayBuffer());
+    const buffer = Buffer.from(await resBody.arrayBuffer());
     writeFileSync(filePath, buffer);
     return filePath;
   }
@@ -278,34 +284,43 @@ export class NotebookClient {
     return { text: result.text, threadId: result.threadId };
   }
 
-  // ── Session ──
+  // ── Session Refresh ──
 
-  private async refreshSession(): Promise<boolean> {
+  private async refreshSession(): Promise<void> {
     const session = this.session!;
 
-    const res = await fetch(NB_URLS.DASHBOARD, {
-      headers: { 'User-Agent': session.userAgent, 'Cookie': session.cookies, 'Accept': 'text/html' },
-      redirect: 'follow',
+    const { statusCode, headers: resHeaders, body: resBody } = await request(NB_URLS.DASHBOARD, {
+      method: 'GET',
+      headers: {
+        'User-Agent': session.userAgent,
+        'Cookie': session.cookies,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      dispatcher: this.agent,
     });
 
-    const html = await res.text();
-    if (res.status !== 200 || html.includes('accounts.google.com/ServiceLogin')) return false;
+    const html = await resBody.text();
+
+    if (statusCode !== 200 || html.includes('accounts.google.com/ServiceLogin')) {
+      throw new Error('Session expired — cookies invalid. Run `webctl notebooklm login`.');
+    }
 
     const atMatch = html.match(/"SNlM0e"\s*:\s*"([^"]+)"/);
     const blMatch = html.match(/"cfb2h"\s*:\s*"([^"]+)"/);
     const fsidMatch = html.match(/"FdrFJe"\s*:\s*"([^"]+)"/);
-
     const atValue = atMatch?.[1];
     const blValue = blMatch?.[1];
-    if (!atValue || !blValue) return false;
-    if (!blValue.includes('labs-tailwind')) return false;
 
-    const setCookies = getSetCookies(res);
-    const newCookies = setCookies.length > 0 ? mergeCookies(session.cookies, setCookies) : session.cookies;
+    if (!atValue || !blValue) throw new Error('Failed to extract tokens from dashboard HTML');
+    if (!blValue.includes('labs-tailwind')) throw new Error(`Unexpected bl: ${blValue.slice(0, 50)}`);
+
+    const setCookies = resHeaders['set-cookie'];
+    const setCookieArr = Array.isArray(setCookies) ? setCookies : setCookies ? [setCookies] : [];
+    const newCookies = setCookieArr.length > 0 ? mergeCookies(session.cookies, setCookieArr) : session.cookies;
 
     this.session = { at: atValue, bl: blValue, fsid: fsidMatch?.[1] ?? '', cookies: newCookies, userAgent: session.userAgent };
     await this.store.save(this.session);
-    return true;
   }
 
   private buildHeaders(): Record<string, string> {
@@ -332,4 +347,3 @@ export class NotebookClient {
     return this.reqCounter;
   }
 }
-

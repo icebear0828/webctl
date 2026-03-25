@@ -1,11 +1,12 @@
 /**
- * Gemini HTTP client — pure Node.js, no browser dependency.
+ * Gemini HTTP client — undici + Chrome TLS fingerprint.
  */
 
+import { request, type Agent } from 'undici';
 import type { GeminiSession, GeminiResponse } from './types.js';
 import type { SessionStore } from '../../core/session.js';
-import { mergeCookies, getSetCookies } from '../../core/cookies.js';
-import { browserLogin } from '../../core/auth.js';
+import { createChromeTlsAgent } from '../../core/tls.js';
+import { mergeCookies } from '../../core/cookies.js';
 import { parseStreamGenerateResponse } from './parser.js';
 
 const GEMINI_BASE = 'https://gemini.google.com';
@@ -15,10 +16,12 @@ const APP_URL = `${GEMINI_BASE}/app`;
 export class GeminiClient {
   private session: GeminiSession | null = null;
   private store: SessionStore<GeminiSession>;
+  private agent: Agent;
   private reqCounter = 100000;
 
   constructor(store: SessionStore<GeminiSession>) {
     this.store = store;
+    this.agent = createChromeTlsAgent();
   }
 
   async loadSession(userId?: string): Promise<boolean> {
@@ -27,11 +30,12 @@ export class GeminiClient {
   }
 
   async chat(message: string, conversationId?: string): Promise<GeminiResponse> {
-    if (!this.session) {
-      throw new Error('No session loaded. Run `webctl gemini auth login` first.');
-    }
+    if (!this.session) throw new Error('No session. Run `webctl gemini login` first.');
 
-    const innerPayload = this.buildChatPayload(message, conversationId);
+    const innerPayload = [
+      [message], [],
+      conversationId ? [conversationId, '', ''] : null,
+    ];
     const raw = await this.callStreamGenerate(innerPayload);
     const parsed = parseStreamGenerateResponse(raw);
 
@@ -45,12 +49,8 @@ export class GeminiClient {
     };
   }
 
-  private buildChatPayload(message: string, conversationId?: string): unknown[] {
-    return [
-      [message],
-      [],
-      conversationId ? [conversationId, '', ''] : null,
-    ];
+  async dispose(): Promise<void> {
+    await this.agent.close();
   }
 
   private async callStreamGenerate(innerPayload: unknown[]): Promise<string> {
@@ -65,91 +65,69 @@ export class GeminiClient {
       ...(session.fsid ? { 'f.sid': session.fsid } : {}),
     });
 
-    const headers = this.buildHeaders();
-    const fullUrl = `${STREAM_GENERATE_URL}?${qp.toString()}`;
+    const { statusCode, body: resBody } = await request(
+      `${STREAM_GENERATE_URL}?${qp.toString()}`,
+      { method: 'POST', headers: this.buildHeaders(), body, dispatcher: this.agent },
+    );
 
-    const res = await fetch(fullUrl, {
-      method: 'POST',
-      headers,
-      body,
-      redirect: 'follow',
-    });
+    const text = await resBody.text();
 
-    const text = await res.text();
-
-    if (res.status === 401 || res.status === 400) {
-      // Try HTTP token refresh first
-      const refreshed = await this.refreshSession();
-      if (!refreshed) {
-        // Fallback: browser login
-        console.error('[gemini] HTTP refresh failed, launching browser login...');
-        this.session = await browserLogin<GeminiSession>(
-          { site: 'gemini', dashboardUrl: APP_URL, blValidator: 'assistant-bard' },
-          this.store,
-          { serviceHash: this.session?.serviceHash ?? '', sessionHash: this.session?.sessionHash ?? '' },
-        );
-      }
-      // Retry once
+    if (statusCode === 401 || statusCode === 400) {
+      await this.refreshSession();
       return this.callStreamGenerate(innerPayload);
     }
 
-    if (!res.ok) {
-      throw new Error(`Gemini HTTP ${res.status}: ${text.slice(0, 200)}`);
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`Gemini HTTP ${statusCode}: ${text.slice(0, 200)}`);
     }
 
     return text;
   }
 
-  private async refreshSession(): Promise<boolean> {
+  private async refreshSession(): Promise<void> {
     const session = this.session!;
 
-    const res = await fetch(APP_URL, {
+    const { statusCode, headers: resHeaders, body: resBody } = await request(APP_URL, {
+      method: 'GET',
       headers: {
         'User-Agent': session.userAgent,
         'Cookie': session.cookies,
-        'Accept': 'text/html',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
       },
-      redirect: 'follow',
+      dispatcher: this.agent,
     });
 
-    const html = await res.text();
+    const html = await resBody.text();
 
-    if (res.status !== 200 || html.includes('accounts.google.com/ServiceLogin')) {
-      return false;
+    if (statusCode !== 200 || html.includes('accounts.google.com/ServiceLogin')) {
+      throw new Error('Session expired — cookies invalid. Run `webctl gemini login`.');
     }
 
     const atMatch = html.match(/"SNlM0e"\s*:\s*"([^"]+)"/);
     const blMatch = html.match(/"cfb2h"\s*:\s*"([^"]+)"/);
     const fsidMatch = html.match(/"FdrFJe"\s*:\s*"([^"]+)"/);
-
     const atValue = atMatch?.[1];
     const blValue = blMatch?.[1];
 
-    if (!atValue || !blValue) return false;
-    if (!blValue.includes('assistant-bard')) return false;
+    if (!atValue || !blValue) throw new Error('Failed to extract tokens from Gemini app HTML');
+    if (!blValue.includes('assistant-bard')) throw new Error(`Unexpected bl: ${blValue.slice(0, 50)}`);
 
     let newServiceHash = session.serviceHash;
     const hashMatch = html.match(/"StreamGenerate"[^"]*"(![\w\-_+/=]+)"/);
     if (hashMatch?.[1]) newServiceHash = hashMatch[1];
 
-    // Merge Set-Cookie
-    const setCookies = getSetCookies(res);
-    const newCookies = setCookies.length > 0
-      ? mergeCookies(session.cookies, setCookies)
-      : session.cookies;
+    const setCookies = resHeaders['set-cookie'];
+    const setCookieArr = Array.isArray(setCookies) ? setCookies : setCookies ? [setCookies] : [];
+    const newCookies = setCookieArr.length > 0 ? mergeCookies(session.cookies, setCookieArr) : session.cookies;
 
     this.session = {
-      at: atValue,
-      bl: blValue,
-      fsid: fsidMatch?.[1] ?? '',
-      cookies: newCookies,
-      userAgent: session.userAgent,
-      serviceHash: newServiceHash,
-      sessionHash: session.sessionHash,
+      at: atValue, bl: blValue, fsid: fsidMatch?.[1] ?? '',
+      cookies: newCookies, userAgent: session.userAgent,
+      serviceHash: newServiceHash, sessionHash: session.sessionHash,
     };
 
     await this.store.save(this.session);
-    return true;
   }
 
   private buildHeaders(): Record<string, string> {
@@ -172,4 +150,3 @@ export class GeminiClient {
     return this.reqCounter;
   }
 }
-

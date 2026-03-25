@@ -22,15 +22,7 @@ function getClient(): NotebookClient {
 async function withClient<T>(userId: string | undefined, fn: (client: NotebookClient) => Promise<T>): Promise<T> {
   const client = getClient();
   const loaded = await client.loadSession(userId);
-  if (!loaded) {
-    // No session — auto browser login
-    console.error('[notebooklm] No session found, launching browser login...');
-    await browserLogin<NotebookSession>(
-      { site: 'notebooklm', dashboardUrl: NB_URLS.DASHBOARD, blValidator: 'labs-tailwind' },
-      getStore(),
-    );
-    await client.loadSession(userId);
-  }
+  if (!loaded) throw new Error('No session. Run `webctl notebooklm login` first.');
   return fn(client);
 }
 

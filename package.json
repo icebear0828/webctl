@@ -15,12 +15,13 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "commander": "^13.0.0"
+    "commander": "^13.0.0",
+    "undici": "^7.24.5"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
-    "@types/node": "^22.0.0"
+    "vitest": "^3.0.0"
   },
   "peerDependencies": {
     "playwright": "^1.49.0"

@@ -5,4 +5,5 @@ export { Strategy, cli, getRegistry, getCommand, getSiteCommands, getSites, type
 export { type CliOutput, type Format, EXIT, formatOutput, success, error } from './output.js';
 export { getProfileDir, ensureProfileDir } from './profiles.js';
 export { mergeCookies, getSetCookies } from './cookies.js';
+export { createChromeTlsAgent } from './tls.js';
 export { browserLogin, type GoogleServiceAuthOptions, type GoogleServiceSession } from './auth.js';
