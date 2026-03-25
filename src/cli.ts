@@ -45,8 +45,14 @@ async function loadSites(): Promise<void> {
 }
 
 function wireCommand(program: Command, cmd: CliCommand, globalOpts: () => { format: Format; verbose: boolean }): void {
-  const siteCmd = program.commands.find(c => c.name() === cmd.site)
-    ?? program.addCommand(new Command(cmd.site).description(`${cmd.site} commands`));
+  let siteCmd = program.commands.find(c => c.name() === cmd.site);
+  if (!siteCmd) {
+    siteCmd = new Command(cmd.site)
+      .description(`${cmd.site} commands`)
+      .enablePositionalOptions()
+      .passThroughOptions();
+    program.addCommand(siteCmd);
+  }
 
   const sub = siteCmd
     .command(cmd.name)
@@ -125,14 +131,9 @@ async function main(): Promise<void> {
 
   const globalOpts = () => program.opts<{ format: Format; verbose: boolean }>();
 
-  // wire all registered commands
-  for (const cmd of getRegistry().values()) {
-    wireCommand(program, cmd, globalOpts);
-  }
-
-  // list command
+  // list command (register before sites to avoid name collision)
   program
-    .command('list')
+    .command('commands')
     .description('List all available commands')
     .action(() => {
       const opts = globalOpts();
@@ -146,6 +147,11 @@ async function main(): Promise<void> {
       );
       console.log(formatOutput(success(data), opts.format));
     });
+
+  // wire all registered site commands
+  for (const cmd of getRegistry().values()) {
+    wireCommand(program, cmd, globalOpts);
+  }
 
   await program.parseAsync();
 }
