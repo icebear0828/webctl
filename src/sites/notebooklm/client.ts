@@ -7,6 +7,8 @@
 
 import type { NotebookSession, NotebookInfo, SourceInfo, ArtifactInfo, StudioConfig, QuotaInfo, ResearchResult } from './types.js';
 import type { SessionStore } from '../../core/session.js';
+import { mergeCookies, getSetCookies } from '../../core/cookies.js';
+import { browserLogin } from '../../core/auth.js';
 import { NB_RPC, NB_URLS, DEFAULT_USER_CONFIG, PLATFORM_WEB } from './rpc-ids.js';
 import {
   parseCreateNotebook, parseListNotebooks, parseNotebookDetail,
@@ -69,7 +71,13 @@ export class NotebookClient {
 
     if (res.status === 401 || res.status === 400) {
       const refreshed = await this.refreshSession();
-      if (!refreshed) throw new Error(`NotebookLM HTTP ${res.status}. Session expired.`);
+      if (!refreshed) {
+        console.error('[notebooklm] HTTP refresh failed, launching browser login...');
+        this.session = await browserLogin<NotebookSession>(
+          { site: 'notebooklm', dashboardUrl: NB_URLS.DASHBOARD, blValidator: 'labs-tailwind' },
+          this.store,
+        );
+      }
       return this.execute(rpcId, payload, sourcePath);
     }
 
@@ -292,8 +300,8 @@ export class NotebookClient {
     if (!atValue || !blValue) return false;
     if (!blValue.includes('labs-tailwind')) return false;
 
-    const setCookieHeader = res.headers.get('set-cookie');
-    const newCookies = setCookieHeader ? mergeCookies(session.cookies, setCookieHeader) : session.cookies;
+    const setCookies = getSetCookies(res);
+    const newCookies = setCookies.length > 0 ? mergeCookies(session.cookies, setCookies) : session.cookies;
 
     this.session = { at: atValue, bl: blValue, fsid: fsidMatch?.[1] ?? '', cookies: newCookies, userAgent: session.userAgent };
     await this.store.save(this.session);
@@ -325,18 +333,3 @@ export class NotebookClient {
   }
 }
 
-function mergeCookies(existing: string, setCookie: string): string {
-  const cookieMap = new Map<string, string>();
-  for (const part of existing.split(';')) {
-    const trimmed = part.trim();
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx > 0) cookieMap.set(trimmed.slice(0, eqIdx).trim(), trimmed.slice(eqIdx + 1).trim());
-  }
-  for (const header of setCookie.split(',')) {
-    const firstSemicolon = header.indexOf(';');
-    const nameValue = firstSemicolon > 0 ? header.slice(0, firstSemicolon) : header;
-    const eqIdx = nameValue.indexOf('=');
-    if (eqIdx > 0) cookieMap.set(nameValue.slice(0, eqIdx).trim(), nameValue.slice(eqIdx + 1).trim());
-  }
-  return Array.from(cookieMap.entries()).map(([n, v]) => `${n}=${v}`).join('; ');
-}

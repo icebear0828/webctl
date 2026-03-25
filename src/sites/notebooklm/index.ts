@@ -4,21 +4,50 @@
 
 import { cli, Strategy, type CommandArgs } from '../../core/registry.js';
 import { createSessionStore } from '../../core/session.js';
+import { browserLogin } from '../../core/auth.js';
 import { NotebookClient } from './client.js';
 import type { NotebookSession } from './types.js';
+import { NB_URLS } from './rpc-ids.js';
 
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours (Google tokens)
 
+function getStore() {
+  return createSessionStore<NotebookSession>({ site: 'notebooklm', ttlMs: SESSION_TTL_MS });
+}
+
 function getClient(): NotebookClient {
-  return new NotebookClient(createSessionStore<NotebookSession>({ site: 'notebooklm', ttlMs: SESSION_TTL_MS }));
+  return new NotebookClient(getStore());
 }
 
 async function withClient<T>(userId: string | undefined, fn: (client: NotebookClient) => Promise<T>): Promise<T> {
   const client = getClient();
   const loaded = await client.loadSession(userId);
-  if (!loaded) throw new Error('No session found. Run `webctl notebooklm auth login` first.');
+  if (!loaded) {
+    // No session — auto browser login
+    console.error('[notebooklm] No session found, launching browser login...');
+    await browserLogin<NotebookSession>(
+      { site: 'notebooklm', dashboardUrl: NB_URLS.DASHBOARD, blValidator: 'labs-tailwind' },
+      getStore(),
+    );
+    await client.loadSession(userId);
+  }
   return fn(client);
 }
+
+// ── Auth ──
+
+cli({
+  site: 'notebooklm', name: 'login', description: 'Login via browser and save session',
+  domain: 'notebooklm.google.com', strategy: Strategy.BROWSER,
+  args: [{ name: 'user', help: 'Session user ID' }],
+  func: async (_t, _s) => {
+    await browserLogin<NotebookSession>(
+      { site: 'notebooklm', dashboardUrl: NB_URLS.DASHBOARD, blValidator: 'labs-tailwind' },
+      getStore(),
+    );
+    return { status: 'logged_in' };
+  },
+});
 
 // ── Notebook commands ──
 

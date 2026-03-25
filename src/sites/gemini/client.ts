@@ -4,6 +4,8 @@
 
 import type { GeminiSession, GeminiResponse } from './types.js';
 import type { SessionStore } from '../../core/session.js';
+import { mergeCookies, getSetCookies } from '../../core/cookies.js';
+import { browserLogin } from '../../core/auth.js';
 import { parseStreamGenerateResponse } from './parser.js';
 
 const GEMINI_BASE = 'https://gemini.google.com';
@@ -76,10 +78,16 @@ export class GeminiClient {
     const text = await res.text();
 
     if (res.status === 401 || res.status === 400) {
-      // Try refresh
+      // Try HTTP token refresh first
       const refreshed = await this.refreshSession();
       if (!refreshed) {
-        throw new Error(`Gemini returned HTTP ${res.status}. Session expired — re-login required.`);
+        // Fallback: browser login
+        console.error('[gemini] HTTP refresh failed, launching browser login...');
+        this.session = await browserLogin<GeminiSession>(
+          { site: 'gemini', dashboardUrl: APP_URL, blValidator: 'assistant-bard' },
+          this.store,
+          { serviceHash: this.session?.serviceHash ?? '', sessionHash: this.session?.sessionHash ?? '' },
+        );
       }
       // Retry once
       return this.callStreamGenerate(innerPayload);
@@ -125,9 +133,9 @@ export class GeminiClient {
     if (hashMatch?.[1]) newServiceHash = hashMatch[1];
 
     // Merge Set-Cookie
-    const setCookieHeader = res.headers.get('set-cookie');
-    const newCookies = setCookieHeader
-      ? mergeCookies(session.cookies, setCookieHeader)
+    const setCookies = getSetCookies(res);
+    const newCookies = setCookies.length > 0
+      ? mergeCookies(session.cookies, setCookies)
       : session.cookies;
 
     this.session = {
@@ -165,27 +173,3 @@ export class GeminiClient {
   }
 }
 
-function mergeCookies(existing: string, setCookie: string): string {
-  const cookieMap = new Map<string, string>();
-
-  for (const part of existing.split(';')) {
-    const trimmed = part.trim();
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx > 0) {
-      cookieMap.set(trimmed.slice(0, eqIdx).trim(), trimmed.slice(eqIdx + 1).trim());
-    }
-  }
-
-  for (const header of setCookie.split(',')) {
-    const firstSemicolon = header.indexOf(';');
-    const nameValue = firstSemicolon > 0 ? header.slice(0, firstSemicolon) : header;
-    const eqIdx = nameValue.indexOf('=');
-    if (eqIdx > 0) {
-      cookieMap.set(nameValue.slice(0, eqIdx).trim(), nameValue.slice(eqIdx + 1).trim());
-    }
-  }
-
-  return Array.from(cookieMap.entries())
-    .map(([name, value]) => `${name}=${value}`)
-    .join('; ');
-}

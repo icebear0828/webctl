@@ -4,18 +4,39 @@
 
 import { cli, Strategy, type CommandArgs } from '../../core/registry.js';
 import { createSessionStore } from '../../core/session.js';
+import { browserLogin } from '../../core/auth.js';
 import { GeminiClient } from './client.js';
 import type { GeminiSession } from './types.js';
 
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
-function getClient(): GeminiClient {
-  const store = createSessionStore<GeminiSession>({
-    site: 'gemini',
-    ttlMs: SESSION_TTL_MS,
-  });
-  return new GeminiClient(store);
+function getStore() {
+  return createSessionStore<GeminiSession>({ site: 'gemini', ttlMs: SESSION_TTL_MS });
 }
+
+function getClient(): GeminiClient {
+  return new GeminiClient(getStore());
+}
+
+// ── Auth ──
+
+cli({
+  site: 'gemini',
+  name: 'login',
+  description: 'Login via browser and save session',
+  domain: 'gemini.google.com',
+  strategy: Strategy.BROWSER,
+  args: [{ name: 'user', help: 'Session user ID' }],
+  func: async (_t, _s, kwargs: CommandArgs) => {
+    const store = getStore();
+    await browserLogin<GeminiSession>(
+      { site: 'gemini', dashboardUrl: 'https://gemini.google.com/app', blValidator: 'assistant-bard' },
+      store,
+      { serviceHash: '', sessionHash: '' },
+    );
+    return { status: 'logged_in' };
+  },
+});
 
 cli({
   site: 'gemini',

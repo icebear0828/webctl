@@ -4,3 +4,5 @@ export { type SessionStore, type SessionStoreOptions, createSessionStore } from 
 export { Strategy, cli, getRegistry, getCommand, getSiteCommands, getSites, type Arg, type CommandArgs, type CommandFunc, type CliCommand, type CliOptions } from './registry.js';
 export { type CliOutput, type Format, EXIT, formatOutput, success, error } from './output.js';
 export { getProfileDir, ensureProfileDir } from './profiles.js';
+export { mergeCookies, getSetCookies } from './cookies.js';
+export { browserLogin, type GoogleServiceAuthOptions, type GoogleServiceSession } from './auth.js';
