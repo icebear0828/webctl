@@ -4,6 +4,21 @@ Make any website your CLI. HTTP-first, browser fallback.
 
 A collection of open-source website CLI adapters designed for AI agents. Each adapter turns a website's functionality into structured, scriptable CLI commands with JSON output.
 
+**English** | [中文](#webctl-1)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D20-green.svg)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org)
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Supported Sites](#supported-sites)
+- [Quick Start](#quick-start)
+- [Session Management](#session-management)
+- [Adding a New Site](#adding-a-new-site)
+- [Development](#development)
+
 ## Architecture
 
 ```
@@ -153,6 +168,17 @@ MIT
 将任何网站变成 CLI。HTTP 优先，浏览器兜底。
 
 一组开源的网站 CLI 适配器，专为 AI agent 设计。每个适配器将网站功能转化为结构化、可脚本化的 CLI 命令，输出 JSON 格式。
+
+[English](#webctl) | **中文**
+
+## 目录
+
+- [架构](#架构)
+- [支持的网站](#支持的网站)
+- [快速开始](#快速开始)
+- [Session 管理](#session-管理)
+- [添加新站点](#添加新站点)
+- [开发](#开发)
 
 ## 架构
 
